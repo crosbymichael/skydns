@@ -412,6 +412,31 @@ func (s *Server) getARecords(q dns.Question) (records []dns.RR, err error) {
 
 			records = append(records, &dns.A{Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 15}, A: net.ParseIP(h)})
 		}
+		return
+	}
+
+	var (
+		services []msg.Service
+		key      = strings.TrimSuffix(q.Name, s.domain+".")
+	)
+
+	services, err = s.registry.Get(key)
+	if err != nil {
+		return
+	}
+
+	for _, serv := range services {
+		ip := net.ParseIP(serv.Host)
+		switch {
+		case ip == nil:
+			continue
+		case ip.To4() != nil:
+			records = append(records, &dns.A{Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: serv.TTL}, A: ip.To4()})
+		case ip.To16() != nil:
+			records = append(records, &dns.AAAA{Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: serv.TTL}, AAAA: ip.To16()})
+		default:
+			panic("skydns: internal error")
+		}
 	}
 
 	return
