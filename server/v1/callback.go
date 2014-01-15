@@ -1,4 +1,4 @@
-package server
+package v1
 
 import (
 	"encoding/json"
@@ -12,15 +12,15 @@ import (
 )
 
 // Handle API add callback requests.
-func (s *Server) addCallbackHTTPHandler(w http.ResponseWriter, req *http.Request) {
-	vars := mux.Vars(req)
+func AddCallbackHTTPHandler(w http.ResponseWriter, req *http.Request, s Server) {
+	var (
+		uuid   string
+		ok     bool
+		vars   = mux.Vars(req)
+		secret = req.Header.Get("Authorization")
+	)
 
-	var uuid string
-	var ok bool
-	var secret string
-
-	secret = req.Header.Get("Authorization")
-	if err := s.authenticate(secret); err != nil {
+	if err := s.Authenticate(secret); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
@@ -43,7 +43,7 @@ func (s *Server) addCallbackHTTPHandler(w http.ResponseWriter, req *http.Request
 	// TODO: this should be a function call (or method)
 	key := cb.Region + "." + strings.Replace(cb.Version, ".", "-", -1) + "." + cb.Name + "." + cb.Environment
 	key = strings.ToLower(key)
-	services, err := s.registry.Get(key)
+	services, err := s.Get(key)
 	if err != nil || len(services) == 0 {
 		log.Println("Service not found for callback", key)
 		http.Error(w, err.Error(), http.StatusNotFound)
@@ -58,13 +58,13 @@ func (s *Server) addCallbackHTTPHandler(w http.ResponseWriter, req *http.Request
 
 	notExists := 0
 	for _, serv := range services {
-		if _, err := s.raftServer.Do(NewAddCallbackCommand(serv, cb)); err != nil {
+		if err := s.Callback(serv, cb); err != nil {
 			switch err {
 			case registry.ErrNotExists:
 				notExists++
 				continue
 			case raft.NotLeaderError:
-				s.redirectToLeader(w, req)
+				RedirectToLeader(w, req, s)
 				return
 			default:
 				log.Println("Error: ", err)

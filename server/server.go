@@ -12,9 +12,10 @@ import (
 	"github.com/goraft/raft"
 	"github.com/gorilla/mux"
 	"github.com/miekg/dns"
-	"github.com/rcrowley/go-metrics"
 	"github.com/skynetservices/skydns/msg"
 	"github.com/skynetservices/skydns/registry"
+	"github.com/skynetservices/skydns/server/v1"
+	"github.com/skynetservices/skydns/stats"
 	"log"
 	"math"
 	"net"
@@ -36,37 +37,12 @@ import (
    TTL cleanup thread should shutdown/start based on being elected master
 */
 
-var expiredCount metrics.Counter
-var requestCount metrics.Counter
-var addServiceCount metrics.Counter
-var updateTTLCount metrics.Counter
-var getServiceCount metrics.Counter
-var removeServiceCount metrics.Counter
-
 func init() {
 	// Register Raft Commands
 	raft.RegisterCommand(&AddServiceCommand{})
 	raft.RegisterCommand(&UpdateTTLCommand{})
 	raft.RegisterCommand(&RemoveServiceCommand{})
 	raft.RegisterCommand(&AddCallbackCommand{})
-
-	expiredCount = metrics.NewCounter()
-	metrics.Register("skydns-expired-entries", expiredCount)
-
-	requestCount = metrics.NewCounter()
-	metrics.Register("skydns-requests", requestCount)
-
-	addServiceCount = metrics.NewCounter()
-	metrics.Register("skydns-add-service-requests", addServiceCount)
-
-	updateTTLCount = metrics.NewCounter()
-	metrics.Register("skydns-update-ttl-requests", updateTTLCount)
-
-	getServiceCount = metrics.NewCounter()
-	metrics.Register("skydns-get-service-requests", getServiceCount)
-
-	removeServiceCount = metrics.NewCounter()
-	metrics.Register("skydns-remove-service-requests", removeServiceCount)
 }
 
 type Server struct {
@@ -118,20 +94,20 @@ func NewServer(members []string, domain string, dnsAddr string, httpAddr string,
 	s.dnsHandler.Handle(".", s)
 
 	// API Routes
-	s.router.HandleFunc("/skydns/services/{uuid}", s.addServiceHTTPHandler).Methods("PUT")
-	s.router.HandleFunc("/skydns/services/{uuid}", s.getServiceHTTPHandler).Methods("GET")
-	s.router.HandleFunc("/skydns/services/{uuid}", s.removeServiceHTTPHandler).Methods("DELETE")
-	s.router.HandleFunc("/skydns/services/{uuid}", s.updateServiceHTTPHandler).Methods("PATCH")
+	s.handleFuncv1("/skydns/services/{uuid}", "PUT", v1.AddServiceHTTPHandler)
+	s.handleFuncv1("/skydns/services/{uuid}", "GET", v1.GetServiceHTTPHandler)
+	s.handleFuncv1("/skydns/services/{uuid}", "DELETE", v1.RemoveServiceHTTPHandler)
+	s.handleFuncv1("/skydns/services/{uuid}", "PATCH", v1.UpdateServiceHTTPHandler)
 
-	s.router.HandleFunc("/skydns/callbacks/{uuid}", s.addCallbackHTTPHandler).Methods("PUT")
+	s.handleFuncv1("/skydns/callbacks/{uuid}", "PUT", v1.AddCallbackHTTPHandler)
 
 	// External API Routes
 	// /skydns/services #list all services
-	s.router.HandleFunc("/skydns/services/", s.getServicesHTTPHandler).Methods("GET")
+	s.handleFuncv1("/skydns/services/", "GET", v1.GetServicesHTTPHandler)
 	// /skydns/regions #list all regions
-	s.router.HandleFunc("/skydns/regions/", s.getRegionsHTTPHandler).Methods("GET")
+	s.handleFuncv1("/skydns/regions/", "GET", v1.GetRegionsHTTPHandler)
 	// /skydns/environnments #list all environments
-	s.router.HandleFunc("/skydns/environments/", s.getEnvironmentsHTTPHandler).Methods("GET")
+	s.handleFuncv1("/skydns/environments/", "GET", v1.GetEnvironmentsHTTPHandler)
 
 	// Raft Routes
 	s.router.HandleFunc("/raft/join", s.joinHandler).Methods("POST")
@@ -276,7 +252,7 @@ run:
 				// probably minimal chance of this happening, this will just cause commands to fail,
 				// and new leader will take over anyway
 				for _, uuid := range expired {
-					expiredCount.Inc(1)
+					stats.ExpiredCount.Inc(1)
 					s.raftServer.Do(NewRemoveServiceCommand(uuid))
 				}
 			}
@@ -339,7 +315,7 @@ func (s *Server) joinHandler(w http.ResponseWriter, req *http.Request) {
 		switch err {
 		case raft.NotLeaderError:
 			log.Println("Redirecting to leader")
-			s.redirectToLeader(w, req)
+			v1.RedirectToLeader(w, req, s)
 		default:
 			log.Println("Error processing join:", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -349,7 +325,7 @@ func (s *Server) joinHandler(w http.ResponseWriter, req *http.Request) {
 
 // Handler for DNS requests, responsible for parsing DNS request and returning response.
 func (s *Server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
-	requestCount.Inc(1)
+	stats.RequestCount.Inc(1)
 
 	m := new(dns.Msg)
 	m.SetReply(req)
@@ -538,191 +514,64 @@ func (s *Server) listenAndServe() {
 	}()
 }
 
-func (s *Server) redirectToLeader(w http.ResponseWriter, req *http.Request) {
-	if s.Leader() != "" {
-		http.Redirect(w, req, "http://"+s.Leader()+req.URL.Path, http.StatusMovedPermanently)
-	} else {
-		log.Println("Error: Leader Unknown")
-		http.Error(w, "Leader unknown", http.StatusInternalServerError)
-	}
-}
-
 // shared auth method on server.
-func (s *Server) authenticate(secret string) (err error) {
+func (s *Server) Authenticate(secret string) (err error) {
 	if s.secret != "" && secret != s.secret {
 		err = errors.New("Forbidden")
 	}
 	return
 }
 
-// Handle API add service requests
-func (s *Server) addServiceHTTPHandler(w http.ResponseWriter, req *http.Request) {
-	addServiceCount.Inc(1)
-	vars := mux.Vars(req)
-
-	var uuid string
-	var ok bool
-	var secret string
-
-	//read the authorization header to get the secret.
-	secret = req.Header.Get("Authorization")
-
-	if err := s.authenticate(secret); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
-	}
-
-	if uuid, ok = vars["uuid"]; !ok {
-		http.Error(w, "UUID required", http.StatusBadRequest)
-		return
-	}
-
-	var serv msg.Service
-
-	if err := json.NewDecoder(req.Body).Decode(&serv); err != nil {
-		log.Println("Error: ", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if serv.Host == "" || serv.Port == 0 {
-		http.Error(w, "Host and Port required", http.StatusBadRequest)
-		return
-	}
-
-	serv.UUID = uuid
-
+// AddService adds a new service to the server
+func (s *Server) AddService(serv msg.Service) error {
 	if _, err := s.raftServer.Do(NewAddServiceCommand(serv)); err != nil {
-		switch err {
-		case registry.ErrExists:
-			http.Error(w, err.Error(), http.StatusConflict)
-		case raft.NotLeaderError:
-			s.redirectToLeader(w, req)
-		default:
-			log.Println("Error: ", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-
-		return
+		return err
 	}
-
-	w.WriteHeader(http.StatusCreated)
+	return nil
 }
 
-// Handle API remove service requests
-func (s *Server) removeServiceHTTPHandler(w http.ResponseWriter, req *http.Request) {
-	removeServiceCount.Inc(1)
-	vars := mux.Vars(req)
-
-	var uuid string
-	var ok bool
-	var secret string
-
-	//read the authorization header to get the secret.
-	secret = req.Header.Get("Authorization")
-
-	if err := s.authenticate(secret); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
-	}
-
-	if uuid, ok = vars["uuid"]; !ok {
-		http.Error(w, "UUID required", http.StatusBadRequest)
-		return
-	}
-
+// RemoveService removes the service provided by uuid from the server
+func (s *Server) RemoveService(uuid string) error {
 	if _, err := s.raftServer.Do(NewRemoveServiceCommand(uuid)); err != nil {
-
-		switch err {
-		case registry.ErrNotExists:
-			http.Error(w, err.Error(), http.StatusNotFound)
-		case raft.NotLeaderError:
-			s.redirectToLeader(w, req)
-		default:
-			log.Println("Error: ", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
+		return err
 	}
+	return nil
 }
 
-// Handle API update service requests
-func (s *Server) updateServiceHTTPHandler(w http.ResponseWriter, req *http.Request) {
-	updateTTLCount.Inc(1)
-	vars := mux.Vars(req)
-
-	var uuid string
-	var ok bool
-	var secret string
-
-	//read the authorization header to get the secret.
-	secret = req.Header.Get("Authorization")
-
-	if err := s.authenticate(secret); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
+// UpdateTTL updates the service from provided by uuid with the provided ttl value
+func (s *Server) UpdateTTL(uuid string, ttl uint32) error {
+	if _, err := s.raftServer.Do(NewUpdateTTLCommand(uuid, ttl)); err != nil {
+		return err
 	}
-
-	if uuid, ok = vars["uuid"]; !ok {
-		http.Error(w, "UUID required", http.StatusBadRequest)
-		return
-	}
-
-	var serv msg.Service
-	if err := json.NewDecoder(req.Body).Decode(&serv); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if _, err := s.raftServer.Do(NewUpdateTTLCommand(uuid, serv.TTL)); err != nil {
-		switch err {
-		case registry.ErrNotExists:
-			http.Error(w, err.Error(), http.StatusNotFound)
-		case raft.NotLeaderError:
-			s.redirectToLeader(w, req)
-		default:
-			log.Println("Error: ", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-	}
+	return nil
 }
 
-// Handle API get service requests
-func (s *Server) getServiceHTTPHandler(w http.ResponseWriter, req *http.Request) {
-	getServiceCount.Inc(1)
-	vars := mux.Vars(req)
+// GetUUID returns the service from the registry provided by the uuid
+func (s *Server) GetUUID(uuid string) (msg.Service, error) {
+	return s.registry.GetUUID(uuid)
+}
 
-	var uuid string
-	var ok bool
-	var secret string
+// Get returns the services provided by the key
+func (s *Server) Get(key string) ([]msg.Service, error) {
+	return s.registry.Get(key)
+}
 
-	//read the authorization header to get the secret.
-	secret = req.Header.Get("Authorization")
-
-	if err := s.authenticate(secret); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
+// Callback sends to service and cb to the server
+func (s *Server) Callback(serv msg.Service, cb msg.Callback) error {
+	if _, err := s.raftServer.Do(NewAddCallbackCommand(serv, cb)); err != nil {
+		return err
 	}
+	return nil
+}
 
-	if uuid, ok = vars["uuid"]; !ok {
-		http.Error(w, "UUID required", http.StatusBadRequest)
-		return
+func (s *Server) handleFuncv1(path, method string, handler func(http.ResponseWriter, *http.Request, v1.Server)) {
+	f := func(w http.ResponseWriter, r *http.Request) {
+		handler(w, r, s)
 	}
-
-	log.Println("Retrieving Service ", uuid)
-	serv, err := s.registry.GetUUID(uuid)
-
-	if err != nil {
-		switch err {
-		case registry.ErrNotExists:
-			http.Error(w, err.Error(), http.StatusNotFound)
-		default:
-			log.Println("Error: ", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-
-		return
+	for _, p := range []string{
+		path,
+		fmt.Sprintf("/v1%s", path),
+	} {
+		s.router.HandleFunc(p, f).Methods(method)
 	}
-
-	var b bytes.Buffer
-	json.NewEncoder(&b).Encode(serv)
-	w.Write(b.Bytes())
 }

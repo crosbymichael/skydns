@@ -2,7 +2,7 @@
 // Use of this source code is governed by The MIT License (MIT) that can be
 // found in the LICENSE file.
 
-package server
+package v1
 
 import (
 	"bytes"
@@ -12,18 +12,16 @@ import (
 	"net/http"
 )
 
-func (s *Server) getRegionsHTTPHandler(w http.ResponseWriter, req *http.Request) {
-	var secret string
-
+func GetRegionsHTTPHandler(w http.ResponseWriter, req *http.Request, s Server) {
 	//read the authorization header to get the secret.
-	secret = req.Header.Get("Authorization")
+	secret := req.Header.Get("Authorization")
 
-	if err := s.authenticate(secret); err != nil {
+	if err := s.Authenticate(secret); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 
-	srv, err := s.registry.Get("*")
+	srv, err := s.Get("*")
 	if err != nil {
 		switch err {
 		case registry.ErrNotExists:
@@ -52,18 +50,16 @@ func (s *Server) getRegionsHTTPHandler(w http.ResponseWriter, req *http.Request)
 
 }
 
-func (s *Server) getEnvironmentsHTTPHandler(w http.ResponseWriter, req *http.Request) {
-	var secret string
-
+func GetEnvironmentsHTTPHandler(w http.ResponseWriter, req *http.Request, s Server) {
 	//read the authorization header to get the secret.
-	secret = req.Header.Get("Authorization")
+	secret := req.Header.Get("Authorization")
 
-	if err := s.authenticate(secret); err != nil {
+	if err := s.Authenticate(secret); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 
-	srv, err := s.registry.Get("*")
+	srv, err := s.Get("*")
 	if err != nil {
 		switch err {
 		case registry.ErrNotExists:
@@ -91,19 +87,17 @@ func (s *Server) getEnvironmentsHTTPHandler(w http.ResponseWriter, req *http.Req
 	w.Write(b.Bytes())
 }
 
-func (s *Server) getServicesHTTPHandler(w http.ResponseWriter, req *http.Request) {
-	var secret string
-
+func GetServicesHTTPHandler(w http.ResponseWriter, req *http.Request, s Server) {
 	//read the authorization header to get the secret.
-	secret = req.Header.Get("Authorization")
+	secret := req.Header.Get("Authorization")
 
-	if err := s.authenticate(secret); err != nil {
+	if err := s.Authenticate(secret); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 
 	log.Println(req.URL.Path)
-	log.Println(s.raftServer.Leader())
+	log.Println(s.Leader())
 
 	var q string
 
@@ -113,7 +107,7 @@ func (s *Server) getServicesHTTPHandler(w http.ResponseWriter, req *http.Request
 
 	log.Println("Retrieving All Services for query", q)
 
-	srv, err := s.registry.Get(q)
+	srv, err := s.Get(q)
 
 	if err != nil {
 		switch err {
